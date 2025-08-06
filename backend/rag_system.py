@@ -2,7 +2,7 @@ import os
 from dotenv import load_dotenv, find_dotenv
 from langchain_community.document_loaders import UnstructuredFileLoader, PyPDFLoader, DirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings
+from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
@@ -27,12 +27,14 @@ from langchain_pinecone import PineconeVectorStore
 from langchain_core.documents import Document
 from ikapi import IKApi, FileStorage
 import logging
-import requests  # Added for Serper API
+import requests  # Added for Serper API and Mistral API
 import urllib.parse  # Added for URL encoding
 from langchain.chains.combine_documents import create_stuff_documents_chain
 import tiktoken  # Add this import for token counting
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from langchain_core.embeddings import Embeddings
+from mistralai import Mistral  # Import Mistral client
 
 # Load environment variables - try absolute path first, then fallback to auto-find
 env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
@@ -50,27 +52,79 @@ def get_pinecone_client():
     pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
     return pc
 
-# Replace the embeddings initialization with a subclass that slices vectors to 1024 dimensions
-class SlicedOpenAIEmbeddings(OpenAIEmbeddings):
-    """OpenAI embeddings that slice vectors to a target dimension."""
+# Replace the embeddings initialization with Mistral embeddings
+class MistralTextEmbeddings(Embeddings):
+    """Mistral embeddings that provide 1024-dimension vectors."""
     
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # Don't set as attribute, just use as a constant in methods
+    def __init__(self, api_key: str = None, model: str = "mistral-embed"):
+        """Initialize Mistral embeddings client.
+        
+        Args:
+            api_key: Mistral API key. If None, will use MISTRAL_API_KEY from environment.
+            model: Mistral embedding model name. Default is 'mistral-embed'.
+        """
+        self.api_key = api_key or os.getenv("MISTRAL_API_KEY")
+        self.model = model
+        if not self.api_key:
+            raise ValueError("MISTRAL_API_KEY environment variable is required")
+        self.client = Mistral(api_key=self.api_key)
     
     def embed_query(self, text: str) -> List[float]:
-        """Embed query text and slice to 1024 dimension"""
-        vec = super().embed_query(text)
-        # Slice to 1024 dimensions
-        return vec[:1024] if len(vec) > 1024 else vec
+        """Embed query text and return 1024-dimensional vector"""
+        try:
+            response = self.client.embeddings.create(
+                model=self.model,
+                inputs=[text]
+            )
+            # Mistral embeddings are already 1024 dimensions
+            return response.data[0].embedding
+        except Exception as e:
+            logger.error(f"Error embedding query: {e}")
+            raise
     
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        """Embed documents and slice each embedding to 1024 dimension"""
-        vectors = super().embed_documents(texts)
-        # Slice each vector to 1024 dimensions
-        return [v[:1024] if len(v) > 1024 else v for v in vectors]
+        """Embed documents and return 1024-dimensional vectors"""
+        try:
+            # Process in chunks to avoid API limits
+            batch_size = 50
+            all_embeddings = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    inputs=batch
+                )
+                batch_embeddings = [data.embedding for data in response.data]
+                all_embeddings.extend(batch_embeddings)
+            
+            return all_embeddings
+        except Exception as e:
+            logger.error(f"Error embedding documents: {e}")
+            raise
 
-embeddings = SlicedOpenAIEmbeddings(model=os.getenv("EMBEDDINGS_MODEL"))
+embeddings = MistralTextEmbeddings(model=os.getenv("EMBEDDINGS_MODEL"))
+
+# Helper function to create LLMs from environment variables
+def create_llm_from_env(llm_type: str) -> ChatGroq:
+    """Create a ChatGroq LLM instance from environment variables.
+    
+    Args:
+        llm_type: Type of LLM ('general', 'specialist', 'planning', 'evaluation')
+    
+    Returns:
+        Configured ChatGroq instance
+    """
+    env_prefix = llm_type.upper() + "_LLM"
+    model = os.getenv(f"{env_prefix}_MODEL")
+    temperature = float(os.getenv(f"{env_prefix}_TEMPERATURE", "0.3"))
+    max_tokens = int(os.getenv(f"{env_prefix}_MAX_TOKENS", "2048"))
+    
+    return ChatGroq(
+        temperature=temperature,
+        model_name=model,
+        max_tokens=max_tokens
+    )
 
 # Document processing pipeline
 def create_vector_store(doc_paths: List[str], index_name: str = os.getenv("DEFAULT_INDEX_NAME"), namespace: str = os.getenv("DEFAULT_NAMESPACE"), books_folder: str = None):
@@ -923,12 +977,8 @@ class ToolManager:
     
     def __init__(self, planning_llm):
         self.tools = {}
-        self.planning_llm = planning_llm  # deepseek-r1 for planning
-        self.evaluation_llm = ChatGroq(
-            temperature=0.1,
-            model_name="deepseek-r1-distill-llama-70b",
-            max_tokens=2048
-        )
+        self.planning_llm = planning_llm  # planning LLM passed from parent
+        self.evaluation_llm = create_llm_from_env("evaluation")
         
         # Planning prompt template
         self.planning_prompt = ChatPromptTemplate.from_template("""
@@ -1157,20 +1207,11 @@ class LegalRAGSystem:
             search_kwargs={"k": 8}
         )
         
-        # Configure models
-        self.general_llm = ChatGroq(
-            temperature=0.3,
-            model_name="deepseek-r1-distill-llama-70b",
-            max_tokens=4096
-        )
+        # Configure models - all using Groq now
+        self.general_llm = create_llm_from_env("general")
         
-        # Switch to OpenAI for GPT-4o with reduced token limits
-        self.legal_specialist = ChatOpenAI(
-            temperature=0.3,
-            model_name="gpt-4.1-mini",
-            max_tokens=2000,  # Reduced from 4096 to leave more room for input
-            request_timeout=120
-        )
+        # Switch to Groq for specialist as well
+        self.legal_specialist = create_llm_from_env("specialist")
         
         # Setup improved prompt with better context handling
         self.qa_prompt = ChatPromptTemplate.from_messages([
@@ -1711,11 +1752,7 @@ class EnhancedLegalRAGSystem(LegalRAGSystem):
         super().__init__(vectorstore)
         
         # Initialize tool-based system
-        self.planning_llm = ChatGroq(
-            temperature=0.1,
-            model_name="deepseek-r1-distill-llama-70b",
-            max_tokens=2048
-        )
+        self.planning_llm = create_llm_from_env("planning")
         
         self.tool_manager = ToolManager(self.planning_llm)
         

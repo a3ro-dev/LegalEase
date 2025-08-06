@@ -111,7 +111,7 @@ st.markdown("""
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = []
 if 'current_tab' not in st.session_state:
-    st.session_state.current_tab = "Legal Keyword Extraction"
+    st.session_state.current_tab = "General Chat"
 
 # App header
 st.markdown("<h1 class='main-header'>LegalEase.app</h1>", unsafe_allow_html=True)
@@ -134,6 +134,7 @@ with st.sidebar:
     st.markdown("### Choose Function")
     
     function_options = [
+        "General Chat",
         "Legal Keyword Extraction", 
         "Legal Argument Composer", 
         "Document Outline Generator", 
@@ -149,7 +150,116 @@ with st.sidebar:
     st.session_state.current_tab = selected_function
 
 # Main content area based on selected function
-if st.session_state.current_tab == "Legal Keyword Extraction":
+if st.session_state.current_tab == "General Chat":
+    st.markdown("### General Legal Chat")
+    st.markdown("""
+    Ask any legal question about Indian law. The system will intelligently decide whether to search 
+    the knowledge base, legal databases, or the web to provide you with the most accurate answer.
+    """)
+    
+    # Add a hint for better user experience
+    with st.expander("ℹ️ How to use this feature", expanded=False):
+        st.markdown("""
+        1. Type your legal question in the chat box below
+        2. Click 'Ask' and the system will research your question
+        3. View the comprehensive answer with sources
+        4. Continue the conversation with follow-up questions
+        """)
+    
+    # Chat interface
+    user_query = st.text_area("Ask your legal question:", 
+                             height=100, 
+                             key="general_chat_input",
+                             help="Type any question about Indian law, legal procedures, or cases")
+    
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        ask_button = st.button("Ask", type="primary", 
+                              help="Click to get an AI-powered answer to your legal question")
+    with col2:
+        use_web = st.checkbox("Include web search", value=True, 
+                             help="Allow the system to search the web for recent information")
+    
+    if ask_button and user_query:
+        with st.spinner("Researching your question..."):
+            try:
+                response = requests.post(
+                    f"{API_URL}/query/stream",
+                    json={
+                        "query": user_query,
+                        "use_web": use_web
+                    },
+                    stream=True,
+                    timeout=120
+                )
+                thinking_placeholder = st.empty()
+                final_answer = ""
+                sources = []
+                
+                for line in response.iter_lines():
+                    if not line: continue
+                    try:
+                        step = json.loads(line.decode('utf-8').replace('data: ', ''))
+                        if step.get('type') in ['thinking','planning','tool_use','retrieval','generation']:
+                            thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
+                        elif step.get('type') == 'complete':
+                            final_answer = step.get('content', '')
+                            details = step.get('details', {})
+                            sources = details.get('sources', [])
+                            break
+                        elif step.get('type') == 'error':
+                            thinking_placeholder.text(f"Error: {step['content']}")
+                            break
+                    except json.JSONDecodeError:
+                        continue
+                
+                thinking_placeholder.empty()
+                
+                # Display the answer
+                if final_answer:
+                    st.markdown("### Answer")
+                    st.markdown(f"""
+                    <div class='response-container'>
+                        {final_answer}
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    # Display sources if available
+                    if sources:
+                        st.markdown("### Sources")
+                        for i, source in enumerate(sources, 1):
+                            source_title = source.get('title', 'Legal Document')
+                            source_url = source.get('source', 'N/A')
+                            st.markdown(f"""
+                            <div class='source-box'>
+                                <div class='source-title'>{i}. {source_title}</div>
+                                <div class='source-url'>{source_url}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
+                    
+                    # Add to chat history
+                    st.session_state.chat_history.append({
+                        'question': user_query,
+                        'answer': final_answer,
+                        'sources': sources
+                    })
+                else:
+                    st.info("I couldn't generate an answer to your question. Please try rephrasing it.")
+                    
+            except Exception as e:
+                st.error(f"An error occurred: {str(e)}")
+    
+    # Display chat history
+    if st.session_state.chat_history:
+        with st.expander(f"📝 Chat History ({len(st.session_state.chat_history)} conversations)", expanded=False):
+            for i, chat in enumerate(reversed(st.session_state.chat_history[-5:]), 1):  # Show last 5 conversations
+                st.markdown(f"**Q{i}:** {chat['question'][:100]}...")
+                st.markdown(f"**A{i}:** {chat['answer'][:200]}...")
+                if chat.get('sources'):
+                    st.markdown(f"*Sources: {len(chat['sources'])} references*")
+                st.markdown("---")
+
+elif st.session_state.current_tab == "Legal Keyword Extraction":
     st.markdown("### Legal Keyword Extraction")
     st.markdown("""
     Extract key legal terms and their definitions from your text. 
@@ -180,7 +290,9 @@ if st.session_state.current_tab == "Legal Keyword Extraction":
             try:
                 response = requests.post(
                     f"{API_URL}/extract_keywords/stream",
-                    json={"text": legal_text},
+                    json={
+                        "text": legal_text
+                    },
                     stream=True,
                     timeout=60
                 )
@@ -188,16 +300,25 @@ if st.session_state.current_tab == "Legal Keyword Extraction":
                 terms = {}
                 for line in response.iter_lines():
                     if not line: continue
-                    step = json.loads(line.decode('utf-8'))
-                    if step.get('type') in ['thinking','retrieval','generation']:
-                        thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
-                    elif step.get('type') == 'complete':
-                        details = step.get('details', {})
-                        terms = details.get('terms', {})
-                        break
-                    elif step.get('type') == 'error':
-                        thinking_placeholder.text(f"Error: {step['content']}")
-                        break
+                    try:
+                        step = json.loads(line.decode('utf-8').replace('data: ', ''))
+                        if step.get('type') in ['thinking','retrieval','generation']:
+                            thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
+                        elif step.get('type') == 'complete':
+                            content = step.get('content', '')
+                            details = step.get('details', {})
+                            try:
+                                # Try to parse the content as JSON (keywords)
+                                terms = json.loads(content) if content else {}
+                            except json.JSONDecodeError:
+                                # If content is not JSON, check details for terms
+                                terms = details.get('terms', {})
+                            break
+                        elif step.get('type') == 'error':
+                            thinking_placeholder.text(f"Error: {step['content']}")
+                            break
+                    except json.JSONDecodeError:
+                        continue
                 
                 # Display results
                 if terms:
@@ -259,11 +380,11 @@ elif st.session_state.current_tab == "Legal Argument Composer":
     with col1:
         if st.button("Add Point", help="Click to add another key point field.") and len(st.session_state.argument_points) < 10:
             st.session_state.argument_points.append("")
-            st.experimental_rerun()
+            st.rerun()
     with col2:
         if st.button("Remove Point", help="Click to remove the last key point field.") and len(st.session_state.argument_points) > 1:
             st.session_state.argument_points.pop()
-            st.experimental_rerun()
+            st.rerun()
     
     if st.button("Generate Argument", type="primary") and topic:
         # Filter out empty points
@@ -276,24 +397,34 @@ elif st.session_state.current_tab == "Legal Argument Composer":
                 try:
                     response = requests.post(
                         f"{API_URL}/generate_argument/stream",
-                        json={"topic": topic, "points": points},
+                        json={
+                            "topic": topic,
+                            "points": points
+                        },
                         stream=True,
                         timeout=90
                     )
                     thinking_placeholder = st.empty()
                     argument = ""
+                    details = {}
                     for line in response.iter_lines():
                         if not line: continue
-                        step = json.loads(line.decode('utf-8'))
-                        if step.get('type') in ['thinking','retrieval','generation']:
-                            thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
-                        elif step.get('type') == 'complete':
-                            argument = step.get('content', '')
-                            details = step.get('details', {})
-                            break
-                        elif step.get('type') == 'error':
-                            thinking_placeholder.text(f"Error: {step['content']}")
-                            break
+                        try:
+                            step = json.loads(line.decode('utf-8').replace('data: ', ''))
+                            if step.get('type') in ['thinking','retrieval','generation','planning']:
+                                thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
+                            elif step.get('type') == 'complete':
+                                argument = step.get('content', '')
+                                details = step.get('details', {})
+                                break
+                            elif step.get('type') == 'error':
+                                thinking_placeholder.text(f"Error: {step['content']}")
+                                break
+                        except json.JSONDecodeError:
+                            continue
+                
+                    thinking_placeholder.empty()
+                    
                     if argument:
                         st.markdown("### Generated Legal Argument")
                         st.markdown(argument)
@@ -332,24 +463,31 @@ elif st.session_state.current_tab == "Document Outline Generator":
             try:
                 response = requests.post(
                     f"{API_URL}/create_outline/stream",
-                    json={"topic": outline_topic, "doc_type": doc_type},
+                    json={
+                        "topic": outline_topic,
+                        "doc_type": doc_type
+                    },
                     stream=True,
                     timeout=60
                 )
                 thinking_placeholder = st.empty()
                 outline_text = ""
+                details = {}
                 for line in response.iter_lines():
                     if not line: continue
-                    step = json.loads(line.decode('utf-8'))
-                    if step.get('type') in ['thinking','retrieval','generation']:
-                        thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
-                    elif step.get('type') == 'complete':
-                        outline_text = step.get('content', '')
-                        details = step.get('details', {})
-                        break
-                    elif step.get('type') == 'error':
-                        thinking_placeholder.text(f"Error: {step['content']}")
-                        break
+                    try:
+                        step = json.loads(line.decode('utf-8').replace('data: ', ''))
+                        if step.get('type') in ['thinking','retrieval','generation','planning']:
+                            thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
+                        elif step.get('type') == 'complete':
+                            outline_text = step.get('content', '')
+                            details = step.get('details', {})
+                            break
+                        elif step.get('type') == 'error':
+                            thinking_placeholder.text(f"Error: {step['content']}")
+                            break
+                    except json.JSONDecodeError:
+                        continue
                 if outline_text:
                     st.markdown("### Document Outline")
                     st.markdown(f"<div class='outline-container'>{outline_text}</div>", unsafe_allow_html=True)
@@ -382,7 +520,9 @@ elif st.session_state.current_tab == "Citation Verifier":
             try:
                 response = requests.post(
                     f"{API_URL}/verify_citation/stream",
-                    json={"citation": citation},
+                    json={
+                        "citation": citation
+                    },
                     stream=True,
                     timeout=60
                 )
@@ -390,15 +530,18 @@ elif st.session_state.current_tab == "Citation Verifier":
                 result_data = {}
                 for line in response.iter_lines():
                     if not line: continue
-                    step = json.loads(line.decode('utf-8'))
-                    if step.get('type') in ['thinking','tool_use','retrieval','generation']:
-                        thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
-                    elif step.get('type') == 'complete':
-                        result_data = step.get('details', {})
-                        break
-                    elif step.get('type') == 'error':
-                        thinking_placeholder.text(f"Error: {step['content']}")
-                        break
+                    try:
+                        step = json.loads(line.decode('utf-8').replace('data: ', ''))
+                        if step.get('type') in ['thinking','tool_use','retrieval','generation']:
+                            thinking_placeholder.text(f"{step['type'].capitalize()}: {step['content']}")
+                        elif step.get('type') == 'complete':
+                            result_data = step.get('details', {})
+                            break
+                        elif step.get('type') == 'error':
+                            thinking_placeholder.text(f"Error: {step['content']}")
+                            break
+                    except json.JSONDecodeError:
+                        continue
                 if result_data:
                     # Display verification result
                     original = result_data.get("original_citation", citation)

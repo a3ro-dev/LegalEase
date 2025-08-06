@@ -1,6 +1,7 @@
 langchain
 groq
 openai
+mistralai
 python-dotenv
 pytesseract
 pymupdf
